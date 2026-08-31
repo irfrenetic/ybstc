@@ -90,23 +90,121 @@ function refreshBookings() {
 // ============================================================
 
 /**
- * Reads every selected class calendar once and returns a
- * structure the sheet writers can render without more API calls.
+ * Shared scan context: the slot times the booking page offers,
+ * plus the day window to query. Built once per run.
+ */
+function buildScanContext_() {
+
+  var slots = generateSlots(PTC_DATE);
+  var slotKeys = {};
+
+  slots.forEach(function(s) {
+    slotKeys[formatHHmm(s)] = true;
+  });
+
+  return {
+    slots: slots,
+    slotKeys: slotKeys,
+    bounds: getDayBounds(PTC_DATE)
+  };
+}
+
+
+/**
+ * Reads ONE class calendar and returns its status plus every booking
+ * on it. Used by the sheet tools and by the web app.
+ */
+function readClass_(row, ctx) {
+
+  var entry = {
+    className: row.className,
+    calendarId: row.calendarId,
+    calendarName: "",
+    status: "OK",
+    slotsTotal: ctx.slots.length,
+    bookings: [],
+    offSlot: 0,
+    freeTimes: []
+  };
+
+  var cal;
+
+  try {
+    cal = CalendarApp.getCalendarById(row.calendarId);
+  } catch (e) {
+    cal = null;
+    entry.status = "ERROR: " + e;
+  }
+
+  if (!cal) {
+
+    if (entry.status === "OK") {
+      entry.status = "NOT FOUND / NO ACCESS";
+    }
+
+    entry.slotsTotal = 0;
+    return entry;
+  }
+
+  entry.calendarName = cal.getName();
+
+  var events;
+
+  try {
+    events = cal.getEvents(ctx.bounds.start, ctx.bounds.end);
+  } catch (e) {
+    entry.status = "ERROR: " + e;
+    return entry;
+  }
+
+  var takenKeys = {};
+
+  events.forEach(function(ev) {
+
+    if (ev.isAllDayEvent && ev.isAllDayEvent()) {
+      return;
+    }
+
+    var booking = parseBooking_(ev, row.className);
+
+    if (ctx.slotKeys[booking.time]) {
+      takenKeys[booking.time] = true;
+    } else {
+      booking.flag = "OFF-SLOT";
+      entry.offSlot++;
+    }
+
+    entry.bookings.push(booking);
+  });
+
+  flagDuplicates_(entry.bookings);
+
+  ctx.slots.forEach(function(s) {
+    var k = formatHHmm(s);
+    if (!takenKeys[k]) {
+      entry.freeTimes.push(k);
+    }
+  });
+
+  entry.bookings.sort(function(a, b) {
+    return a.start - b.start;
+  });
+
+  return entry;
+}
+
+
+/**
+ * Reads every selected class calendar and returns one entry each.
  */
 function readAllClasses_() {
 
   var classes = selectedClasses();
-  var slots = generateSlots(PTC_DATE);
-  var bounds = getDayBounds(PTC_DATE);
+  var ctx = buildScanContext_();
 
   // Apps Script stops a run at 6 minutes. Leave a margin so the
   // sheets still get written with whatever was read.
   var deadline = Date.now() + MAX_SCAN_MS;
-
-  var slotKeys = {};
-  slots.forEach(function(s) {
-    slotKeys[formatHHmm(s)] = true;
-  });
 
   var out = [];
 
@@ -126,79 +224,7 @@ function readAllClasses_() {
       return;
     }
 
-    var entry = {
-      className: row.className,
-      calendarId: row.calendarId,
-      calendarName: "",
-      status: "OK",
-      slotsTotal: slots.length,
-      bookings: [],
-      offSlot: 0,
-      freeTimes: []
-    };
-
-    var cal;
-
-    try {
-      cal = CalendarApp.getCalendarById(row.calendarId);
-    } catch (e) {
-      cal = null;
-      entry.status = "ERROR: " + e;
-    }
-
-    if (!cal) {
-
-      if (entry.status === "OK") {
-        entry.status = "NOT FOUND / NO ACCESS";
-      }
-
-      entry.slotsTotal = 0;
-      out.push(entry);
-      return;
-    }
-
-    entry.calendarName = cal.getName();
-
-    var events;
-
-    try {
-      events = cal.getEvents(bounds.start, bounds.end);
-    } catch (e) {
-      entry.status = "ERROR: " + e;
-      out.push(entry);
-      return;
-    }
-
-    var takenKeys = {};
-
-    events.forEach(function(ev) {
-
-      if (ev.isAllDayEvent && ev.isAllDayEvent()) {
-        return;
-      }
-
-      var booking = parseBooking_(ev, row.className);
-
-      if (slotKeys[booking.time]) {
-        takenKeys[booking.time] = true;
-      } else {
-        booking.flag = "OFF-SLOT";
-        entry.offSlot++;
-      }
-
-      entry.bookings.push(booking);
-    });
-
-    flagDuplicates_(entry.bookings);
-
-    slots.forEach(function(s) {
-      var k = formatHHmm(s);
-      if (!takenKeys[k]) {
-        entry.freeTimes.push(k);
-      }
-    });
-
-    out.push(entry);
+    out.push(readClass_(row, ctx));
   });
 
   return out;
@@ -432,12 +458,7 @@ function writeBookings_(data) {
 
   data.forEach(function(c) {
 
-    c.bookings
-      .slice()
-      .sort(function(a, b) {
-        return a.start - b.start;
-      })
-      .forEach(function(b) {
+    c.bookings.forEach(function(b) {
 
         rows.push([
           false,
@@ -454,8 +475,8 @@ function writeBookings_(data) {
           b.guests,
           c.calendarId,
           b.eventId
-        ]);
-      });
+      ]);
+    });
   });
 
   sheet

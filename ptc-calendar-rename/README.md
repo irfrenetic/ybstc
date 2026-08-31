@@ -6,9 +6,11 @@ Apps Script tools for the 60 per-class PTC booking calendars
 
 | File | What it does |
 | --- | --- |
-| `Config.gs` | Shared settings + the class → calendar ID map. Required by both tools. |
+| `Config.gs` | Shared settings + the class → calendar ID map. Required by all of them. |
 | `RenameCalendars.gs` | Renames every calendar from `PTC Day` to `<Class Name> PTC`. |
-| `Manager.gs` | Dashboard, booking list, duplicate detection, slot deletion. |
+| `Manager.gs` | Reads the calendars; writes the dashboard + booking sheets; deletes bookings. |
+| `WebApp.gs` | Serves the admin page and answers its calls. |
+| `Admin.html` | The admin page itself: live dashboard, search, one-click delete. |
 
 The class → calendar ID map was read out of the `var CALENDAR_ID = "…"` line
 in each row of the `WebApp` sheet in **PTC 2026 Merger**.
@@ -17,12 +19,42 @@ in each row of the `WebApp` sheet in **PTC 2026 Merger**.
 
 1. Sign in as the account that owns the calendars (the School profile).
 2. [script.google.com](https://script.google.com) → **New project**.
-3. Add three files and paste in `Config.gs`, `RenameCalendars.gs`, `Manager.gs`.
+3. Add the files and paste them in: `Config.gs`, `Manager.gs`, `WebApp.gs`,
+   `RenameCalendars.gs`, and an **HTML** file named exactly `Admin`
+   (File → New → HTML file → `Admin`) for `Admin.html`.
 4. **Services (+) → Google Calendar API → Add** (identifier stays `Calendar`).
 5. Run `refreshAll()` once and accept the OAuth prompt.
 
 `Config.gs` holds the map, so the calendar IDs are written down once and
-both tools stay in sync. Keep all three files in the same project.
+every tool stays in sync. Keep all the files in one project.
+
+## The admin page (recommended)
+
+Deploy → **New deployment** → **Web app**
+
+- Execute as: **Me**
+- Who has access: **Only myself**
+
+The page can delete bookings, so keep it private. To let a colleague in,
+set `ADMIN_EMAILS` in `WebApp.gs` to the addresses allowed, then widen the
+deployment to *Anyone with a Google account* — anyone not on that list gets
+turned away.
+
+What the page gives you:
+
+- **Live totals** — calendars reachable, slots taken across all classes and
+  as a percentage, slots still free, duplicates found.
+- **A card per class** — fill bar, `18 / 26`, and a red badge when that class
+  has repeat bookings. Click a card to open its appointment list.
+- **Filters** — by grade (P1…P6), *Duplicates only*, and a search box that
+  matches student, parent, or email across every class you have loaded.
+- **Delete** — a button on each booking. It asks for confirmation, shows who
+  is being cancelled, and lets you choose whether Google emails the parent.
+  The slot is free again the moment it returns.
+- **Export to Sheet** — writes the same data into the two sheets below.
+
+Classes are read a few at a time, so the dashboard fills in as results
+arrive rather than making you wait for all 60 calendars in one request.
 
 ## Renaming
 
@@ -36,9 +68,10 @@ Result codes: `RENAMED` (changed for everyone), `RENAMED_FOR_ME_ONLY`
 (no edit access, personal display name only), `SUBSCRIBED`, `ALREADY_OK`,
 `NOT_FOUND`, `FAILED`.
 
-## Managing bookings
+## The spreadsheet view
 
-`refreshAll()` reads all 60 calendars and writes two sheets. With no bound
+Use this for bulk work — deleting twenty duplicates in one pass, or keeping
+a record. `refreshAll()` reads all 60 calendars and writes two sheets. With no bound
 spreadsheet it creates **PTC Control Panel** and logs the URL; that file is
 remembered for later runs.
 
