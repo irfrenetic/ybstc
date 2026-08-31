@@ -1,17 +1,26 @@
 /**
- * SHARED CONFIG for the PTC calendar tools.
+ * PTC ADMIN
  *
- * Paste this file into the Apps Script project together with
- * RenameCalendars.gs and Manager.gs. All three share this one map,
- * so a calendar ID is only ever written down once.
+ * One page to watch and fix the 60 class booking calendars:
+ * how many are live, how many slots are taken, which parents booked
+ * twice, and a delete button to free a slot.
  *
- * SETUP (once):
- *   Services (+) -> Google Calendar API -> Add (identifier stays "Calendar").
+ * SETUP
+ *   1) script.google.com -> New project, signed in as the account that
+ *      owns the calendars.
+ *   2) Two files: this one (Code.gs) and an HTML file named Index.
+ *   3) Services (+) -> Google Calendar API -> Add (identifier: Calendar).
+ *   4) Deploy -> New deployment -> Web app
+ *        Execute as:     Me
+ *        Who has access: Only myself
+ *   5) Open the web app URL. Bookmark it.
+ *
+ * The page also has a Rename calendars button, which retitles every
+ * calendar from "PTC Day" to "<Class Name> PTC".
  */
 
 // ============================================================
-// CONFERENCE SETTINGS
-// These must match the per-class booking scripts.
+// 1) CONFERENCE SETTINGS - must match the booking scripts
 // ============================================================
 
 var PTC_DATE = "2026-09-25";
@@ -24,35 +33,12 @@ var DAY_END     = { h: 15, m: 0  };
 
 var SLOT_MINUTES = 15;
 
-// Title prefix the booking web app writes:
-// "PTC Appointment | <Class> | <Student>"
-var BOOKING_TITLE_PREFIX = "PTC Appointment";
+// Calendars are renamed to className + this suffix.
+var NAME_SUFFIX = " PTC";
 
 
 // ============================================================
-// OUTPUT SPREADSHEET
-// Leave "" to auto-use the bound spreadsheet, or auto-create one
-// named below and remember it in Script Properties.
-// ============================================================
-
-var OUTPUT_SPREADSHEET_ID = "";
-var OUTPUT_SPREADSHEET_NAME = "PTC Control Panel";
-
-var DASHBOARD_SHEET = "PTC Dashboard";
-var BOOKINGS_SHEET  = "PTC Bookings";
-
-
-// ============================================================
-// CLASS FILTER
-// "" = all 60 classes. Set e.g. "P1" to work on one grade only,
-// which keeps each run well under the 6-minute limit.
-// ============================================================
-
-var CLASS_FILTER = "";
-
-
-// ============================================================
-// CLASS -> CALENDAR ID  (from "PTC 2026 Merger", WebApp sheet)
+// 2) CLASS -> CALENDAR ID  (from "PTC 2026 Merger", WebApp sheet)
 // ============================================================
 
 var CLASS_CALENDARS = [
@@ -120,21 +106,453 @@ var CLASS_CALENDARS = [
 
 
 // ============================================================
-// SHARED HELPERS
+// 3) WEB APP
+// ============================================================
+
+function doGet() {
+
+  return HtmlService
+    .createHtmlOutputFromFile("Index")
+    .setTitle("PTC Admin")
+    .addMetaTag(
+      "viewport",
+      "width=device-width, initial-scale=1"
+    );
+}
+
+
+/**
+ * Class list and conference settings. Returned immediately so the page
+ * can draw itself before any calendar is read.
+ */
+function webGetClasses() {
+
+  return {
+    dateHuman: Utilities.formatDate(
+      makeLocalDate(PTC_DATE, 12, 0),
+      TZ,
+      "EEEE, d MMMM yyyy"
+    ),
+    slotMinutes: SLOT_MINUTES,
+    slotsPerClass: generateSlots(PTC_DATE).length,
+    classes: CLASS_CALENDARS.map(function(row) {
+      return { className: row.className };
+    })
+  };
+}
+
+
+/**
+ * Reads one class calendar. The page calls this once per class, a few at
+ * a time, so the dashboard fills in as results arrive instead of one
+ * request having to carry all 60 calendars.
+ */
+function webGetClass(className) {
+
+  return readClass_(findClassRow_(className));
+}
+
+
+/**
+ * Deletes one booking, after re-checking it against the live event.
+ * Returns the class refreshed, so the page stays accurate.
+ */
+function webDeleteBooking(req) {
+
+  var row = findClassRow_(req.className);
+
+  var check = verifyEvent_(
+    row.calendarId,
+    req.eventId,
+    req.time,
+    req.student
+  );
+
+  if (!check.ok) {
+    return {
+      ok: false,
+      message: "Not deleted: " + check.reason + ".",
+      klass: readClass_(row)
+    };
+  }
+
+  removeEvent_(
+    row.calendarId,
+    req.eventId,
+    req.notify ? "all" : "none"
+  );
+
+  return {
+    ok: true,
+    message:
+      (req.student || "Booking") + " at " + req.time + " deleted" +
+      (req.notify ? ", parent notified." : "."),
+    klass: readClass_(row)
+  };
+}
+
+
+/**
+ * Renames every calendar to "<Class Name> PTC".
+ *
+ * A real rename needs owner access. Without it the calendar gets a
+ * personal display name instead, which only this account sees.
+ */
+function webRenameCalendars() {
+
+  var renamed = 0;
+  var personal = 0;
+  var already = 0;
+  var failed = [];
+
+  CLASS_CALENDARS.forEach(function(row) {
+
+    var target = row.className + NAME_SUFFIX;
+
+    try {
+
+      var cal = Calendar.Calendars.get(row.calendarId);
+
+      if (cal.summary === target) {
+        already++;
+        return;
+      }
+
+      Calendar.Calendars.patch(
+        { summary: target },
+        row.calendarId
+      );
+
+      renamed++;
+
+    } catch (e) {
+
+      try {
+
+        Calendar.CalendarList.patch(
+          { summaryOverride: target },
+          row.calendarId
+        );
+
+        personal++;
+
+      } catch (e2) {
+        failed.push(row.className);
+      }
+    }
+  });
+
+  return {
+    renamed: renamed,
+    personal: personal,
+    already: already,
+    failed: failed
+  };
+}
+
+
+// ============================================================
+// 4) READING A CALENDAR
+// ============================================================
+
+function readClass_(row) {
+
+  var slots = generateSlots(PTC_DATE);
+  var bounds = getDayBounds(PTC_DATE);
+
+  var slotKeys = {};
+
+  slots.forEach(function(s) {
+    slotKeys[formatHHmm(s)] = true;
+  });
+
+  var entry = {
+    className: row.className,
+    calendarName: "",
+    status: "OK",
+    slotsTotal: slots.length,
+    booked: 0,
+    free: 0,
+    duplicates: 0,
+    offSlot: 0,
+    freeTimes: [],
+    bookings: []
+  };
+
+  var cal;
+
+  try {
+    cal = CalendarApp.getCalendarById(row.calendarId);
+  } catch (e) {
+    entry.status = "ERROR: " + e;
+    entry.slotsTotal = 0;
+    return entry;
+  }
+
+  if (!cal) {
+    entry.status = "NOT FOUND / NO ACCESS";
+    entry.slotsTotal = 0;
+    return entry;
+  }
+
+  entry.calendarName = cal.getName();
+
+  var events;
+
+  try {
+    events = cal.getEvents(bounds.start, bounds.end);
+  } catch (e) {
+    entry.status = "ERROR: " + e;
+    return entry;
+  }
+
+  var taken = {};
+
+  events.forEach(function(ev) {
+
+    if (ev.isAllDayEvent && ev.isAllDayEvent()) {
+      return;
+    }
+
+    var booking = parseBooking_(ev);
+
+    if (slotKeys[booking.time]) {
+      taken[booking.time] = true;
+    } else {
+      booking.flag = "OFF-SLOT";
+      entry.offSlot++;
+    }
+
+    entry.bookings.push(booking);
+  });
+
+  flagDuplicates_(entry.bookings);
+
+  entry.bookings.sort(function(a, b) {
+    return a.time < b.time ? -1 : (a.time > b.time ? 1 : 0);
+  });
+
+  entry.bookings.forEach(function(b) {
+    if (b.flag.indexOf("DUPLICATE") === 0) {
+      entry.duplicates++;
+    }
+  });
+
+  slots.forEach(function(s) {
+
+    var k = formatHHmm(s);
+
+    if (!taken[k]) {
+      entry.freeTimes.push(k);
+    }
+  });
+
+  entry.booked = entry.bookings.length;
+  entry.free = entry.freeTimes.length;
+
+  return entry;
+}
+
+
+/**
+ * Turns one calendar event into a booking record.
+ * The booking page writes "PTC Appointment | <Class> | <Student>" as the
+ * title, and Class/Parent/Student/Phone/Email into the description.
+ */
+function parseBooking_(ev) {
+
+  var title = ev.getTitle() || "";
+
+  var plain = (ev.getDescription() || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/<[^>]+>/g, "");
+
+  function field(label) {
+
+    var m = plain.match(
+      new RegExp(label + "\\s*:\\s*([^\\n]*)", "i")
+    );
+
+    return m ? m[1].trim() : "";
+  }
+
+  var parts = title.split("|");
+
+  var studentFromTitle =
+    parts.length >= 3
+      ? parts[parts.length - 1].trim()
+      : "";
+
+  var guests = [];
+
+  try {
+    guests = ev.getGuestList().map(function(g) {
+      return normalizeEmail_(g.getEmail());
+    });
+  } catch (e) {
+    guests = [];
+  }
+
+  return {
+    time: formatHHmm(ev.getStartTime()),
+    student: field("Student") || studentFromTitle,
+    parent: field("Parent"),
+    email: normalizeEmail_(field("Email")) || guests[0] || "",
+    phone: field("Phone"),
+    created: Utilities.formatDate(
+      ev.getDateCreated(), TZ, "d MMM, HH:mm"
+    ),
+    createdMs: ev.getDateCreated().getTime(),
+    eventId: ev.getId(),
+    flag: ""
+  };
+}
+
+
+/**
+ * Flags repeat bookings inside one class.
+ *
+ * The booking page already MOVES a parent's booking when they rebook
+ * with the same email, so a real duplicate means the same student was
+ * booked from two different addresses, or one address produced two
+ * events. The earliest booking is kept; later ones are flagged.
+ */
+function flagDuplicates_(bookings) {
+
+  var byStudent = {};
+  var byEmail = {};
+
+  bookings
+    .slice()
+    .sort(function(a, b) {
+      return a.createdMs - b.createdMs;
+    })
+    .forEach(function(b) {
+
+      if (b.flag === "OFF-SLOT") {
+        return;
+      }
+
+      var sKey = String(b.student || "").trim().toLowerCase();
+      var eKey = b.email;
+
+      if (sKey && byStudent[sKey]) {
+        b.flag = "Repeat booking - also at " + byStudent[sKey].time;
+        return;
+      }
+
+      if (eKey && byEmail[eKey]) {
+        b.flag = "Same email - also at " + byEmail[eKey].time;
+        return;
+      }
+
+      if (sKey) byStudent[sKey] = b;
+      if (eKey) byEmail[eKey] = b;
+    });
+
+  // Both messages start with a word the page checks for.
+  bookings.forEach(function(b) {
+    if (b.flag && b.flag !== "OFF-SLOT") {
+      b.flag = "DUPLICATE: " + b.flag;
+    }
+  });
+}
+
+
+// ============================================================
+// 5) DELETING
 // ============================================================
 
 /**
- * The classes this run should touch, after CLASS_FILTER.
+ * Confirms the live event still matches what the page is showing, so a
+ * stale page cannot delete the wrong parent's slot.
  */
-function selectedClasses() {
+function verifyEvent_(calendarId, eventId, expectedTime, expectedStudent) {
 
-  if (!CLASS_FILTER) {
-    return CLASS_CALENDARS;
+  var cal = CalendarApp.getCalendarById(calendarId);
+
+  if (!cal) {
+    return { ok: false, reason: "calendar not accessible" };
   }
 
-  return CLASS_CALENDARS.filter(function(row) {
-    return row.className.indexOf(CLASS_FILTER) === 0;
-  });
+  var ev;
+
+  try {
+    ev = cal.getEventById(eventId);
+  } catch (e) {
+    return { ok: false, reason: "lookup failed" };
+  }
+
+  if (!ev) {
+    return { ok: false, reason: "already deleted" };
+  }
+
+  if (formatHHmm(ev.getStartTime()) !== expectedTime) {
+    return { ok: false, reason: "time changed, refresh first" };
+  }
+
+  if (expectedStudent) {
+
+    var haystack = (
+      String(ev.getTitle() || "") + " " +
+      String(ev.getDescription() || "")
+    ).toLowerCase();
+
+    if (haystack.indexOf(expectedStudent.toLowerCase()) === -1) {
+      return { ok: false, reason: "student changed, refresh first" };
+    }
+  }
+
+  return { ok: true };
+}
+
+
+/**
+ * Removes an event. sendUpdates "all" emails the parent a cancellation,
+ * "none" frees the slot silently.
+ */
+function removeEvent_(calendarId, eventId, sendUpdates) {
+
+  try {
+
+    Calendar.Events.remove(
+      calendarId,
+      String(eventId).split("@")[0],
+      { sendUpdates: sendUpdates }
+    );
+
+  } catch (e) {
+
+    // Advanced service unavailable - CalendarApp always notifies.
+    var cal = CalendarApp.getCalendarById(calendarId);
+
+    if (!cal) throw e;
+
+    var ev = cal.getEventById(eventId);
+
+    if (!ev) throw e;
+
+    ev.deleteEvent();
+  }
+}
+
+
+// ============================================================
+// 6) HELPERS
+// ============================================================
+
+function findClassRow_(className) {
+
+  var match = CLASS_CALENDARS.filter(function(row) {
+    return row.className === className;
+  })[0];
+
+  if (!match) {
+    throw new Error("Unknown class: " + className);
+  }
+
+  return match;
 }
 
 
@@ -169,8 +587,8 @@ function getDayBounds(dateStr) {
 
 
 /**
- * The exact slot start times the booking page offers.
- * Same morning/afternoon windows as the per-class scripts.
+ * The exact slot start times the booking page offers:
+ * morning window, then afternoon window.
  */
 function generateSlots(dateStr) {
 
@@ -196,53 +614,4 @@ function generateSlots(dateStr) {
 
 function normalizeEmail_(s) {
   return String(s || "").trim().toLowerCase();
-}
-
-
-/**
- * Resolves the spreadsheet used for the dashboard and booking list.
- * Order: OUTPUT_SPREADSHEET_ID -> bound spreadsheet -> remembered one
- * -> newly created one (its URL is logged).
- */
-function getOutputSpreadsheet_() {
-
-  if (OUTPUT_SPREADSHEET_ID) {
-    return SpreadsheetApp.openById(OUTPUT_SPREADSHEET_ID);
-  }
-
-  var bound = SpreadsheetApp.getActiveSpreadsheet();
-  if (bound) {
-    return bound;
-  }
-
-  var props = PropertiesService.getScriptProperties();
-  var saved = props.getProperty("PTC_OUTPUT_SS_ID");
-
-  if (saved) {
-    try {
-      return SpreadsheetApp.openById(saved);
-    } catch (e) {
-      // remembered file is gone - fall through and make a new one
-    }
-  }
-
-  var ss = SpreadsheetApp.create(OUTPUT_SPREADSHEET_NAME);
-
-  props.setProperty("PTC_OUTPUT_SS_ID", ss.getId());
-
-  Logger.log("Created control panel: " + ss.getUrl());
-
-  return ss;
-}
-
-
-function getOrCreateSheet_(ss, name) {
-
-  var sheet = ss.getSheetByName(name);
-
-  if (!sheet) {
-    sheet = ss.insertSheet(name);
-  }
-
-  return sheet;
 }

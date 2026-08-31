@@ -1,4 +1,4 @@
-<!-- PTC ADMIN - served by WebApp.gs doGet(). -->
+<!-- PTC ADMIN - served by doGet() in Code.gs. -->
 <style>
   :root {
     --navy:    #1e3a8a;
@@ -394,7 +394,7 @@
 
     <div class="actions">
       <button id="btnRefresh" class="primary">Refresh all</button>
-      <button id="btnExport">Export to Sheet</button>
+      <button id="btnRename">Rename calendars</button>
     </div>
   </header>
 
@@ -806,7 +806,8 @@
           '<td class="time">' + esc(b.time) + '</td>' +
           '<td>' + esc(b.student || "—") +
             (b.flag
-              ? '<div class="flagtxt">' + esc(b.flag) + '</div>'
+              ? '<div class="flagtxt">' +
+                esc(b.flag.replace("DUPLICATE: ", "")) + '</div>'
               : '') +
           '</td>' +
           '<td>' + esc(b.parent || "—") +
@@ -852,7 +853,6 @@
 
     pending = {
       className: className,
-      calendarId: k.calendarId,
       eventId: b.eventId,
       time: b.time,
       student: b.student
@@ -924,19 +924,41 @@
     loadAll();
   });
 
-  $("btnExport").addEventListener("click", function() {
+  $("btnRename").addEventListener("click", function() {
 
-    $("btnExport").disabled = true;
-    toast("Writing the dashboard and booking sheets…");
+    if (!confirm(
+      "Rename all " + CLASSES.length +
+      " calendars to \"<Class Name> PTC\"?"
+    )) {
+      return;
+    }
 
-    call("webExportToSheet")
-      .then(function(res) {
-        $("btnExport").disabled = false;
-        toast("Sheet updated. Opening…");
-        window.open(res.url, "_blank");
+    $("btnRename").disabled = true;
+    toast("Renaming calendars…");
+
+    call("webRenameCalendars")
+      .then(function(r) {
+
+        $("btnRename").disabled = false;
+
+        var msg =
+          r.renamed + " renamed, " +
+          r.already + " already correct" +
+          (r.personal
+            ? ", " + r.personal + " renamed for this account only"
+            : "") +
+          (r.failed.length
+            ? ". Failed: " + r.failed.join(", ")
+            : ".");
+
+        toast(msg, r.failed.length > 0);
+
+        STATE = {};
+        render();
+        loadAll();
       })
       .catch(function(e) {
-        $("btnExport").disabled = false;
+        $("btnRename").disabled = false;
         toast(String(e && e.message || e), true);
       });
   });
